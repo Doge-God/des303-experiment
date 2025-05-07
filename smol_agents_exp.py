@@ -16,15 +16,6 @@ def roll_dice() -> int:
 
 agent = CodeAgent(tools=[roll_dice], model=model, add_base_tools=False, max_steps=5, verbosity_level=3)
 
-# agent.run(
-#     "Roll a dice for me."
-# )
-
-
-
-
-# print(agent.logs)
-
 def main():
     GradioUI(agent).launch()
 

@@ -1,3 +1,4 @@
+import random
 from pydantic import BaseModel
 
 import pprint
@@ -8,11 +9,13 @@ from pydantic_ai.messages import TextPart, ModelResponse, ModelRequest, UserProm
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.agent import InstrumentationSettings
+import logfire
+
+logfire.configure()
 
 import asyncio
 
-instrumentation_settings = InstrumentationSettings(event_mode='logs')
-
+Agent.instrument_all()
 
 class CityLocation(BaseModel):
     city: str
@@ -31,11 +34,17 @@ ollama_model = OpenAIModel(
 )
 
 
-main_agent = Agent(ollama_model, result_type=AgentResponseResult, 
-                   system_prompt="You are a helpful assistent, try to connect with the user. The user input is an audio transcript that might not be directed at you. Based on the conversation history to determine if the input is valid. If so, give response accordingly, else leave model response empty. Do not use plain text, only call functions.",
+main_agent = Agent(ollama_model, output_type=AgentResponseResult, 
+                   system_prompt="You are a helpful assistent with some tools, try to connect with the user.", 
                    retries=3) 
 
+filter_agent = Agent(ollama_model, output_type=bool,
+                      system_prompt="The user input is an audio transcript that might not be directed at you. Determine if the input is directed at you. Do not use plain text, only call functions")
 
+@main_agent.tool_plain
+def roll_die() -> str:
+    """Roll a six-sided die and return the result."""
+    return str(random.randint(1, 6))
 
 async def main():
     model_messages:list[ModelMessage] = None
@@ -46,22 +55,23 @@ async def main():
             print("Goodbye!")
             break
         
-        result = await main_agent.run(user_input, message_history=model_messages)
+        with capture_run_messages() as capture:
+            try:
+                result = await main_agent.run(user_input, message_history=model_messages)
+            except Exception as e:
+                pprint.pprint(capture)
         
-        if result.data.is_input_valid:
+        if result.output.is_input_valid:
             if not model_messages:
                 model_messages = [result.new_messages()[0]]
-            # Append the new message as a single text response
             else:
                 model_messages.append(ModelRequest(parts=[UserPromptPart(content=user_input)]))
 
-            model_messages.append(ModelResponse(model_name=ollama_model.model_name, parts=[TextPart(content=result.data.model_response)]))
+            model_messages.append(ModelResponse(model_name=ollama_model.model_name, parts=[TextPart(content=result.output.model_response)]))
             
-            print("\nAssistant:", result.data.model_response)
+            print("\nAssistant:", result.output.model_response)
         else:
             print("\nAssistant: (Input not valid, try again.)")
-        
-        pprint.pprint(model_messages)
 
 
 if __name__ == "__main__":
