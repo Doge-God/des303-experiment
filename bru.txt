@@ -8,3 +8,5 @@ pyserial
 torch
 torchaudio
 faster-whisper
+librosa 
+soundfile

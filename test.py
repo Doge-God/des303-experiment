@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 import json
+import logging
 import queue
+import sys
 import time
 import threading
 from faster_whisper import WhisperModel
@@ -55,10 +57,11 @@ class Transcriber(ABC):
 class VoskTranscriber(Transcriber):
     def __init__(self, sample_rate=16000):
         # Load Vosk model
-        self.stt_model = Model(model_path="C:/Users/fzho027/Documents/des303-experiment/voice_models/vosk-model-small-en-us-0.15")
+        self.stt_model = Model(model_path="voice_models/vosk-model-small-en-us-0.15")
         self.stt_recognizer = KaldiRecognizer(self.stt_model, sample_rate)
     
     def transcribe(self, full_audio) -> str:
+        self.stt_recognizer.Reset()
         if self.stt_recognizer.AcceptWaveform(full_audio):
             result = self.stt_recognizer.Result()
             return json.loads(result)["text"]
@@ -68,14 +71,35 @@ class VoskTranscriber(Transcriber):
 
 class FasterWhisperTranscriber(Transcriber):
     def __init__(self):
-        self.model = WhisperModel(model_size_or_path="small.en", device="cpu")
-        
+        self.model = WhisperModel(model_size_or_path="tiny.en", device="cpu",download_root="huggingface_cache")
+        print("Faster Whisper model loaded")
+
     def transcribe(self, full_audio):
         audio_data_array: np.ndarray = np.frombuffer(full_audio, np.int16).astype(np.float32) / 255.0
         segments, info = self.model.transcribe(audio_data_array)
         full_text = " ".join([segment.text for segment in segments])
         return full_text
-
+    
+# logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+class WhisperStreamTranscriber:
+    def __init__(self):
+        from whisper_online import FasterWhisperASR, OnlineASRProcessor
+        asr = FasterWhisperASR("en", "tiny.en", cache_dir="huggingface_cache")
+        self.streaming_processor = OnlineASRProcessor(asr)
+        self.cnt = 0
+    
+    def stream_transcribe(self, audio_chunk:bytes):
+        audio_data_array: np.ndarray = np.frombuffer(audio_chunk, np.int16).astype(np.float32) / 255.0
+        self.streaming_processor.insert_audio_chunk(audio_data_array)
+        self.cnt += 1
+        if self.cnt >= 30:
+            self.cnt = 0
+            partial_out = self.streaming_processor.process_iter()
+            print(partial_out)
+    
+    def reset(self):
+        self.streaming_processor.finish()
+        self.cnt = 0
     
 
 class STT:
@@ -96,6 +120,7 @@ class STT:
         self.vad_validator = SileroVAD()
 
         self.transcriber = FasterWhisperTranscriber()
+        self.stream_transcriber = WhisperStreamTranscriber()
 
         # State flags
         self.is_recording_utterance = False
@@ -137,6 +162,7 @@ class STT:
         silence_buffer = deque(maxlen=int(self.vad_silence / (self.chunk_size / self.sample_rate)))
         print("Listening...")
 
+        # logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
         while True: 
             if not self.audio_data.empty():
                 chunk = self.audio_data.get()
@@ -144,23 +170,28 @@ class STT:
                 prob = self.vad_validator.get_speech_confidence(chunk)
                 is_speech = prob > self.vad_threshold
 
-                # if is recording utterace
-                if self.is_recording_utterance:
-                    self.utterance_chunks.append(chunk)
-                    silence_buffer.append(not is_speech)
+              
+                if prob > 0.75:
+                    self.stream_transcriber.stream_transcribe(chunk)
+
+                # # if is recording utterace
+                # if self.is_recording_utterance:
+                    
+                #     # self.utterance_chunks.append(chunk)
+                #     # silence_buffer.append(not is_speech)
                 
-                    # all corresponding buffer silent, transcribe
-                    if all(silence_buffer):
-                        self.is_recording_utterance = False
-                        full_audio = b''.join(self.utterance_chunks)
+                #     # # all corresponding buffer silent, transcribe
+                #     # if all(silence_buffer):
+                #     #     self.is_recording_utterance = False
+                #     #     full_audio = b''.join(self.utterance_chunks)
                         
-                        yield self.transcriber.transcribe(full_audio)
-                # in stand by
-                else:
-                    if is_speech:
-                        self.is_recording_utterance = True
-                        self.utterance_chunks = [chunk]
-                        silence_buffer.clear()
+                #     #     yield self.transcriber.transcribe(full_audio)
+                # # in stand by
+                # else:
+                #     if is_speech:
+                #         self.is_recording_utterance = True
+                #         self.utterance_chunks = [chunk]
+                #         silence_buffer.clear()
             
             if not self.is_stream_open:
                 print("Finished Transcribe.")
@@ -171,8 +202,9 @@ class STT:
         self.is_stream_open = False
 
 if __name__ == "__main__":
+    
     stt = STT(vad_threshold=0.6, vad_silence=1.0)
-
+    print("Spawned STT")
     try:
         for transcript in stt.transcribe():
             print("Transcript:", transcript)

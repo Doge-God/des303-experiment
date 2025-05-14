@@ -174,3 +174,4 @@ cython_debug/
 .pypirc
 
 /context_data
+/huggingface_cache
