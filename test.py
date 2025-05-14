@@ -1,78 +1,181 @@
-import random
-from pydantic import BaseModel
+from abc import ABC, abstractmethod
+import json
+import queue
+import time
+import threading
+from faster_whisper import WhisperModel
+import numpy as np
+import pyaudio
+import torch
+from vosk import Model, KaldiRecognizer
+from collections import deque
 
-import pprint
+class SileroVAD:
+    def __init__(self, sample_rate=16000):
+        # Load the Silero VAD model
+        self.model, self.utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
+        self.sample_rate = sample_rate
+    
+    def __int2float(self,sound):
+        abs_max = np.abs(sound).max()
+        sound = sound.astype('float32')
+        if abs_max > 0:
+            sound *= 1/32768
+        sound = sound.squeeze()  # depends on the use case
+        return sound
 
-from pydantic_ai import Agent, capture_run_messages
-from pydantic_ai.models import ModelMessage
-from pydantic_ai.messages import TextPart, ModelResponse, ModelRequest, UserPromptPart
-from pydantic_ai.models.openai import OpenAIModel
-from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.agent import InstrumentationSettings
-import logfire
-
-logfire.configure()
-
-import asyncio
-
-Agent.instrument_all()
-
-class CityLocation(BaseModel):
-    city: str
-    country: str
-
-class UserInputResult(BaseModel):
-    is_complete: bool
-    is_relevant: bool
-
-class AgentResponseResult(BaseModel):
-    is_input_valid: bool
-    model_response: str
-
-ollama_model = OpenAIModel(
-    model_name='qwen2.5:7b-instruct', provider=OpenAIProvider(base_url='http://127.0.0.1:11434/v1')
-)
-
-
-main_agent = Agent(ollama_model, output_type=AgentResponseResult, 
-                   system_prompt="You are a helpful assistent with some tools, try to connect with the user.", 
-                   retries=3) 
-
-filter_agent = Agent(ollama_model, output_type=bool,
-                      system_prompt="The user input is an audio transcript that might not be directed at you. Determine if the input is directed at you. Do not use plain text, only call functions")
-
-@main_agent.tool_plain
-def roll_die() -> str:
-    """Roll a six-sided die and return the result."""
-    return str(random.randint(1, 6))
-
-async def main():
-    model_messages:list[ModelMessage] = None
-
-    while True: 
-        user_input = input("You: ")
-        if user_input.lower() == "exit":
-            print("Goodbye!")
-            break
+    def __visualize_bar(self,value):
+        # Ensure value is within 0 to 1
+        value = max(0, min(1, value))
+        total_length = 20
+        filled_length = int(round(value * total_length))
+        bar = '█' * filled_length + '-' * (total_length - filled_length)
+        return f"[{bar}] {value:.2f}"
+    
+    def get_speech_confidence(self, audio_chunk:bytes, is_visualizing=False) -> float:
+        '''Audio chunk has to have 512 frames at 16000hz sample rate, or 256 at 8000hz'''
+         # Convert bytes to numpy array
+        audio_float32 = self.__int2float(np.frombuffer(audio_chunk, dtype=np.int16))
+        # Convert to tensor
+        audio_tensor = torch.from_numpy(audio_float32)
+        # Compute speech probability
+        with torch.no_grad():
+            prob = self.model(audio_tensor, self.sample_rate).item()
         
-        with capture_run_messages() as capture:
-            try:
-                result = await main_agent.run(user_input, message_history=model_messages)
-            except Exception as e:
-                pprint.pprint(capture)
-        
-        if result.output.is_input_valid:
-            if not model_messages:
-                model_messages = [result.new_messages()[0]]
-            else:
-                model_messages.append(ModelRequest(parts=[UserPromptPart(content=user_input)]))
+        # visualize
+        if is_visualizing:
+            print(self.__visualize_bar(prob))
+        return prob
+    
+class Transcriber(ABC):
+    @abstractmethod
+    def transcribe(self, full_audio:bytes) -> str:
+        pass
 
-            model_messages.append(ModelResponse(model_name=ollama_model.model_name, parts=[TextPart(content=result.output.model_response)]))
-            
-            print("\nAssistant:", result.output.model_response)
+class VoskTranscriber(Transcriber):
+    def __init__(self, sample_rate=16000):
+        # Load Vosk model
+        self.stt_model = Model(model_path="C:/Users/fzho027/Documents/des303-experiment/voice_models/vosk-model-small-en-us-0.15")
+        self.stt_recognizer = KaldiRecognizer(self.stt_model, sample_rate)
+    
+    def transcribe(self, full_audio) -> str:
+        if self.stt_recognizer.AcceptWaveform(full_audio):
+            result = self.stt_recognizer.Result()
+            return json.loads(result)["text"]
         else:
-            print("\nAssistant: (Input not valid, try again.)")
+            partial_result = self.stt_recognizer.PartialResult()
+            return json.loads(partial_result)["partial"]
 
+class FasterWhisperTranscriber(Transcriber):
+    def __init__(self):
+        self.model = WhisperModel(model_size_or_path="small.en", device="cpu")
+        
+    def transcribe(self, full_audio):
+        audio_data_array: np.ndarray = np.frombuffer(full_audio, np.int16).astype(np.float32) / 255.0
+        segments, info = self.model.transcribe(audio_data_array)
+        full_text = " ".join([segment.text for segment in segments])
+        return full_text
+
+    
+
+class STT:
+    def __init__(self, vad_threshold=0.95, vad_silence=1.0, sample_rate=16000, chuck_size=512, format=pyaudio.paInt16, channels=1):
+        # audio stream setting
+        self.sample_rate = sample_rate
+        self.chunk_size = chuck_size  
+        self.format = format
+        self.channels = channels
+
+        # data structures
+        self.audio_data = queue.Queue()
+        self.utterance_chunks = []
+
+        # vad settings and init
+        self.vad_threshold = vad_threshold
+        self.vad_silence = vad_silence
+        self.vad_validator = SileroVAD()
+
+        self.transcriber = FasterWhisperTranscriber()
+
+        # State flags
+        self.is_recording_utterance = False
+        self.is_stream_open = False
+        
+        # PyAudio stream
+        self.stream_reading_thread = None
+        
+    # Thread function
+    def audio_reader_thread_func(self):
+        p = pyaudio.PyAudio()
+
+        stream = p.open(format=self.format,
+                        channels=self.channels,
+                        rate=self.sample_rate,
+                        input=True,
+                        frames_per_buffer=self.chunk_size)
+
+        try:
+            while True:
+                data = stream.read(self.chunk_size, exception_on_overflow=False)
+                self.audio_data.put(data)
+                if not self.is_stream_open:
+                    break
+        finally:
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+    
+    def transcribe(self):
+        # clear any remaining audio data
+        self.audio_data = queue.Queue()
+        # open stream and gather data
+        self.is_stream_open = True
+        self.audio_reader_thread = threading.Thread(target=self.audio_reader_thread_func, daemon=True)
+        self.audio_reader_thread.start()
+
+        # silence buffer
+        silence_buffer = deque(maxlen=int(self.vad_silence / (self.chunk_size / self.sample_rate)))
+        print("Listening...")
+
+        while True: 
+            if not self.audio_data.empty():
+                chunk = self.audio_data.get()
+
+                prob = self.vad_validator.get_speech_confidence(chunk)
+                is_speech = prob > self.vad_threshold
+
+                # if is recording utterace
+                if self.is_recording_utterance:
+                    self.utterance_chunks.append(chunk)
+                    silence_buffer.append(not is_speech)
+                
+                    # all corresponding buffer silent, transcribe
+                    if all(silence_buffer):
+                        self.is_recording_utterance = False
+                        full_audio = b''.join(self.utterance_chunks)
+                        
+                        yield self.transcriber.transcribe(full_audio)
+                # in stand by
+                else:
+                    if is_speech:
+                        self.is_recording_utterance = True
+                        self.utterance_chunks = [chunk]
+                        silence_buffer.clear()
+            
+            if not self.is_stream_open:
+                print("Finished Transcribe.")
+                break
+  
+
+    def stop(self):
+        self.is_stream_open = False
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    stt = STT(vad_threshold=0.6, vad_silence=1.0)
+
+    try:
+        for transcript in stt.transcribe():
+            print("Transcript:", transcript)
+    except KeyboardInterrupt:
+        print("Stopping...")
+        stt.stop()

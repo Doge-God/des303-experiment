@@ -2,3 +2,9 @@ pydantic-ai
 chromadb
 pyaudio
 vosk
+PyAudio
+pydantic-ai[logfire]
+pyserial
+torch
+torchaudio
+faster-whisper
