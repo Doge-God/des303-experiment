@@ -5,6 +5,7 @@ import queue
 import sys
 import time
 import threading
+from typing import Callable, Optional
 from faster_whisper import WhisperModel
 import numpy as np
 import pyaudio
@@ -82,23 +83,38 @@ class FasterWhisperTranscriber(Transcriber):
     
 # logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 class WhisperStreamTranscriber:
-    def __init__(self):
+    def __init__(self, chunks_per_iter = 30):
         from whisper_online import FasterWhisperASR, OnlineASRProcessor
         asr = FasterWhisperASR("en", "tiny.en", cache_dir="huggingface_cache")
         self.streaming_processor = OnlineASRProcessor(asr)
         self.cnt = 0
+        self.chuncks_per_iter = chunks_per_iter
     
-    def stream_transcribe(self, audio_chunk:bytes):
+    def add_chunk_to_transcribe(self, audio_chunk:bytes):
         audio_data_array: np.ndarray = np.frombuffer(audio_chunk, np.int16).astype(np.float32) / 255.0
         self.streaming_processor.insert_audio_chunk(audio_data_array)
         self.cnt += 1
-        if self.cnt >= 30:
+        if self.cnt >= self.chuncks_per_iter: # runs every 30 * 32ms
             self.cnt = 0
             partial_out = self.streaming_processor.process_iter()
-            print(partial_out)
+            # print(partial_out)
+
+            if partial_out != (None,None,""):
+                return partial_out
+            
+    def stop(self):
+        # print("TRANSCRIBE STOP")
+        partial_out = self.streaming_processor.process_iter()
+        if partial_out != (None,None,""):
+            # print("PARTIAL OUT STOP" + str(partial_out))
+            return partial_out
+        remaining_output = self.streaming_processor.finish()
+        if remaining_output != (None,None,""):
+            # print("REMAIN OUT STOP" + str(remaining_output))
+            return remaining_output
     
     def reset(self):
-        self.streaming_processor.finish()
+        self.streaming_processor.init()
         self.cnt = 0
     
 
@@ -120,7 +136,7 @@ class STT:
         self.vad_validator = SileroVAD()
 
         self.transcriber = FasterWhisperTranscriber()
-        self.stream_transcriber = WhisperStreamTranscriber()
+        self.stream_transcriber = WhisperStreamTranscriber(chunks_per_iter=35)
 
         # State flags
         self.is_recording_utterance = False
@@ -146,9 +162,71 @@ class STT:
                 if not self.is_stream_open:
                     break
         finally:
+            print("Stopping stream.")
             stream.stop_stream()
             stream.close()
             p.terminate()
+
+    def transcribe_stream(self, 
+                          on_vad_val_change:Optional[Callable[[float],None]] = None, 
+                          on_streaming_transctiption_change:Optional[Callable[[str],None]] = None,
+                          on_vad_prob_change:Optional[Callable[[float],None]] = None):
+        # clear any remaining audio data
+        self.audio_data = queue.Queue()
+        # open stream and gather data
+        self.is_stream_open = True
+        self.audio_reader_thread = threading.Thread(target=self.audio_reader_thread_func, daemon=True)
+        self.audio_reader_thread.start()
+
+        self.stream_transcriber.reset()
+        vad_val = self.vad_silence
+        transcription = ""
+
+        while True: 
+            if not self.audio_data.empty():
+                chunk = self.audio_data.get()
+                prob = self.vad_validator.get_speech_confidence(chunk)
+
+                # report current vad prob if applicable
+                if on_vad_prob_change:
+                    on_vad_prob_change(prob)
+                
+                partial_out = self.stream_transcriber.add_chunk_to_transcribe(chunk)
+
+                if partial_out:
+                    _,_,partial_text = partial_out
+                    transcription += partial_text
+                    #report ongoing transcription change
+                    if on_streaming_transctiption_change:
+                        on_streaming_transctiption_change(transcription)
+
+                # reduce or reset vad val if no speech detected
+                if (prob < self.vad_threshold and transcription):
+                    vad_val -= (self.chunk_size / self.sample_rate) # chunk in second
+                else:
+                    vad_val = self.vad_silence
+                
+                # report vad val percentage
+                if on_vad_val_change:
+                    on_vad_val_change(vad_val / self.vad_silence)
+
+                # reach no speech condition, stop and give final transcription
+                if vad_val <= 0:
+                    last_partial_out = self.stream_transcriber.stop()
+                    if last_partial_out:
+                        _,_,last_partial_text = last_partial_out
+                        transcription += last_partial_text
+                        #report ongoing transcription change
+                        if on_streaming_transctiption_change:
+                            on_streaming_transctiption_change(transcription)
+
+                    #stop stream
+                    self.is_stream_open = False
+                    return transcription
+                    
+
+                
+
     
     def transcribe(self):
         # clear any remaining audio data
@@ -172,7 +250,7 @@ class STT:
 
               
                 if prob > 0.75:
-                    self.stream_transcriber.stream_transcribe(chunk)
+                    self.stream_transcriber.add_chunk_to_transcribe(chunk)
 
                 # # if is recording utterace
                 # if self.is_recording_utterance:
@@ -197,13 +275,12 @@ class STT:
                 print("Finished Transcribe.")
                 break
   
-
     def stop(self):
         self.is_stream_open = False
 
 if __name__ == "__main__":
     
-    stt = STT(vad_threshold=0.6, vad_silence=1.0)
+    stt = STT(vad_threshold=0.7, vad_silence=2.0  )
     print("Spawned STT")
     try:
         for transcript in stt.transcribe():

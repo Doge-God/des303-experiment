@@ -10,3 +10,4 @@ torchaudio
 faster-whisper
 librosa 
 soundfile
+keyboard
